@@ -1,6 +1,8 @@
 using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 using Microsoft.EntityFrameworkCore;
 using NetworkOptimizer.Core.Helpers;
 using NetworkOptimizer.Storage.Models;
@@ -50,7 +52,8 @@ public class PerfTweaksDeploymentService : IPerfTweaksDeploymentService
         ["postgresql-backup"] = "09-postgresql-ssd-backup.sh",
         ["journald-volatile"] = "10-journald-volatile.sh",
         ["sfp-sgmiiplus-port6"] = "19-sfp-sgmiiplus-eth5.sh",
-        ["sfp-sgmiiplus"] = "20-sfp-sgmiiplus.sh"
+        ["sfp-sgmiiplus"] = "20-sfp-sgmiiplus.sh",
+        ["ipv6-prefix-deprecation"] = "30-ipv6-prefix-deprecation.sh"
     };
 
     // Additional boot scripts a tweak deploys beyond its primary, for out-of-date
@@ -221,7 +224,7 @@ public class PerfTweaksDeploymentService : IPerfTweaksDeploymentService
                 "echo '---GATEWAY_MODEL---'; ubnt-device-info model_short 2>/dev/null || (grep -i '^shortname=' /proc/ubnthal/system.info 2>/dev/null | cut -d= -f2-) || echo 'unknown'; echo; " +
                 "echo '---FIRMWARE_VERSION---'; ubnt-device-info firmware 2>/dev/null || (grep -i '^version=' /etc/os-release 2>/dev/null | cut -d= -f2- | tr -d '\"') || echo 'unknown'; echo; " +
                 // Boot script hashes (for version checking)
-                $"echo '---SCRIPT_HASHES---'; for s in 15-fan-control-tuning.sh 06-mongodb-ssd-offload.sh 07-mongodb-ssd-backup.sh 08-postgresql-ssd-offload.sh 09-postgresql-ssd-backup.sh 10-journald-volatile.sh 19-sfp-sgmiiplus-eth5.sh 20-sfp-sgmiiplus.sh; do [ -f {OnBootDir}/$s ] && echo \"$s:$(md5sum {OnBootDir}/$s | cut -d' ' -f1)\"; done; " +
+                $"echo '---SCRIPT_HASHES---'; for s in 15-fan-control-tuning.sh 06-mongodb-ssd-offload.sh 07-mongodb-ssd-backup.sh 08-postgresql-ssd-offload.sh 09-postgresql-ssd-backup.sh 10-journald-volatile.sh 19-sfp-sgmiiplus-eth5.sh 20-sfp-sgmiiplus.sh 30-ipv6-prefix-deprecation.sh; do [ -f {OnBootDir}/$s ] && echo \"$s:$(md5sum {OnBootDir}/$s | cut -d' ' -f1)\"; done; " +
                 // Fan control
                 $"echo '---FAN_BOOT_SCRIPT---'; test -f {OnBootDir}/15-fan-control-tuning.sh && echo 'exists' || echo 'missing'; " +
                 "echo '---FAN_PWM---'; cat /sys/class/hwmon/hwmon0/pwm1 2>/dev/null || echo 'N/A'; " +
@@ -289,7 +292,12 @@ public class PerfTweaksDeploymentService : IPerfTweaksDeploymentService
                 "echo '---SFP_CLOCK_RATE---'; cat /sys/kernel/debug/clk/uniphy1_gcc_tx_clk/clk_rate 2>/dev/null || echo 'N/A'; " +
                 $"echo '---SFP_SERDES_REG---'; if [ -f {OnBootDir}/20-sfp-sgmiiplus.sh ] || lsmod | grep -q force_uniphy1_sgmiiplus; then busybox devmem 0x07A10218 32 2>/dev/null || echo 'N/A'; else echo 'N/A'; fi; " +
                 "echo '---SFP_ETH6_SPEED---'; ethtool eth6 2>/dev/null | grep Speed | awk '{print $2}' || echo 'N/A'; " +
-                "echo '---SFP_LOG---'; tail -3 /var/log/sfp-sgmiiplus.log 2>/dev/null || echo 'no log'";
+                "echo '---SFP_LOG---'; tail -3 /var/log/sfp-sgmiiplus.log 2>/dev/null || echo 'no log'; " +
+                // IPv6 prefix deprecation: the daemon rewrites its RAM-only status file at least every 30 s
+                $"echo '---IPV6_DEP_BOOT_SCRIPT---'; test -f {OnBootDir}/30-ipv6-prefix-deprecation.sh && echo 'exists' || echo 'missing'; " +
+                "echo '---IPV6_DEP_SERVICE---'; systemctl is-active ipv6-prefix-deprecation 2>/dev/null || echo 'inactive'; " +
+                "echo '---IPV6_DEP_STATUS---'; cat /run/ipv6-prefix-deprecation/status.json 2>/dev/null || echo 'missing'; echo; " +
+                "echo '---IPV6_DEP_NOW---'; date +%s";
 
             var result = await RunCommandAsync(combinedCommand, TimeSpan.FromSeconds(25));
             if (!result.success)
@@ -499,6 +507,8 @@ public class PerfTweaksDeploymentService : IPerfTweaksDeploymentService
         }
         status.Tweaks["journald-volatile"] = journaldStatus;
 
+        status.Tweaks["ipv6-prefix-deprecation"] = ParseIpv6DeprecationStatus(sections);
+
         // qca-ssdk is shared between both SFP ports
         var sfpQcaSsdkLoaded = GetSection(sections, "SFP_QCA_SSDK").Trim() == "loaded";
         status.SfpQcaSsdkMissing = !sfpQcaSsdkLoaded;
@@ -633,6 +643,64 @@ public class PerfTweaksDeploymentService : IPerfTweaksDeploymentService
         }
     }
 
+    // The daemon writes its status every 30 s; twice that without an update means it is stuck.
+    private const int Ipv6DeprecationStaleSeconds = 60;
+
+    private static TweakDeploymentStatus ParseIpv6DeprecationStatus(Dictionary<string, string> sections)
+    {
+        var tweak = new TweakDeploymentStatus { Id = "ipv6-prefix-deprecation" };
+        tweak.BootScriptDeployed = GetSection(sections, "IPV6_DEP_BOOT_SCRIPT").Contains("exists");
+        var serviceActive = GetSection(sections, "IPV6_DEP_SERVICE").Trim() == "active";
+        tweak.RuntimeDetected = serviceActive;
+        if (!tweak.BootScriptDeployed && !serviceActive)
+            return tweak;
+
+        tweak.HealthChecks.Add(new("Service", serviceActive ? "Running" : "Not running", serviceActive ? HealthCheckStatus.Ok : HealthCheckStatus.Error));
+
+        Ipv6DeprecationDaemonStatus? daemon = null;
+        try
+        {
+            daemon = JsonSerializer.Deserialize<Ipv6DeprecationDaemonStatus>(GetSection(sections, "IPV6_DEP_STATUS").Trim());
+        }
+        catch (JsonException)
+        {
+            // "missing" or a torn read: treated as no status below
+        }
+
+        if (daemon == null)
+        {
+            if (serviceActive)
+                tweak.HealthChecks.Add(new("Status", "No status reported", HealthCheckStatus.Error));
+            return tweak;
+        }
+
+        var fresh = long.TryParse(GetSection(sections, "IPV6_DEP_NOW").Trim(), out var gatewayNow)
+            && gatewayNow - daemon.Heartbeat <= Ipv6DeprecationStaleSeconds;
+        if (!fresh)
+            tweak.HealthChecks.Add(new("Status", "Not updating", HealthCheckStatus.Error));
+        else if (daemon.State == "error")
+        {
+            tweak.HealthChecks.Add(new("Status", "Error", HealthCheckStatus.Error));
+            tweak.IssueDescription = daemon.Error;
+        }
+        else if (daemon.Networks == 0)
+            tweak.HealthChecks.Add(new("Networks", "No SLAAC network found", HealthCheckStatus.Warning));
+        else
+        {
+            tweak.HealthChecks.Add(new("Networks", $"{daemon.Networks} watched", HealthCheckStatus.Ok));
+            tweak.HealthChecks.Add(new("Old Prefixes", daemon.Deprecating > 0 ? $"{daemon.Deprecating} being deprecated" : "None",
+                HealthCheckStatus.Ok));
+        }
+
+        if (fresh && daemon.State != "error" && daemon.Error != null)
+            tweak.HealthChecks.Add(new("State File", daemon.Error, HealthCheckStatus.Warning));
+        if (!string.IsNullOrEmpty(daemon.LastEvent))
+            tweak.HealthChecks.Add(new("Last Event", daemon.LastEvent, HealthCheckStatus.Ok));
+
+        tweak.IsActive = tweak.BootScriptDeployed && serviceActive && fresh && daemon.State != "error";
+        return tweak;
+    }
+
     /// <summary>Applies the site's stored PerfTweakSettings (manual deploys, decommission record).</summary>
     private async Task ApplyStoredSettingsAsync(PerfTweaksStatus status)
     {
@@ -734,6 +802,9 @@ public class PerfTweaksDeploymentService : IPerfTweaksDeploymentService
             using var networkRestart = tweakId == "mongodb-ssd" ? NetworkRestartWindow() : null;
             Report($"Running {scriptName}...");
             var runResult = await RunCommandAsync($"{OnBootDir}/{scriptName} 2>&1", TimeSpan.FromMinutes(5));
+            // The boot script exits non-zero when its service did not start; the tweak then does nothing.
+            if (!runResult.success && tweakId == "ipv6-prefix-deprecation")
+                return (false, $"Service did not start: {Tail(runResult.output)}", steps);
             if (!runResult.success)
             {
                 Report($"Warning: Script returned non-zero exit. Output: {runResult.output}");
@@ -1061,6 +1132,18 @@ public class PerfTweaksDeploymentService : IPerfTweaksDeploymentService
                     "rm -f /var/log/sfp-sgmiiplus.log; " +
                     "echo 'removed'";
             }
+            else if (tweakId == "ipv6-prefix-deprecation")
+            {
+                // Stop the daemon before deleting it, or Restart=always brings it back. Old prefixes
+                // already deprecated on clients stay deprecated; no final RA is sent.
+                removeCmd =
+                    $"rm -f {OnBootDir}/{scriptName}; " +
+                    "systemctl disable --now ipv6-prefix-deprecation 2>/dev/null; " +
+                    "rm -f /etc/systemd/system/ipv6-prefix-deprecation.service; " +
+                    "systemctl daemon-reload; " +
+                    "rm -rf /data/ipv6-prefix-deprecation; " +
+                    "systemctl is-active --quiet ipv6-prefix-deprecation || echo 'removed'";
+            }
             else
             {
                 removeCmd = $"rm -f {OnBootDir}/{scriptName} && echo 'removed'";
@@ -1375,5 +1458,16 @@ public class TweakDeploymentStatus
 }
 
 public record HealthCheckResult(string Label, string Value, HealthCheckStatus Status);
+
+/// <summary>/run/ipv6-prefix-deprecation/status.json, written by the gateway daemon.</summary>
+internal sealed class Ipv6DeprecationDaemonStatus
+{
+    [JsonPropertyName("state")] public string State { get; set; } = "";
+    [JsonPropertyName("networks")] public int Networks { get; set; }
+    [JsonPropertyName("deprecating")] public int Deprecating { get; set; }
+    [JsonPropertyName("last_event")] public string? LastEvent { get; set; }
+    [JsonPropertyName("error")] public string? Error { get; set; }
+    [JsonPropertyName("heartbeat")] public long Heartbeat { get; set; }
+}
 
 public enum HealthCheckStatus { Ok, Warning, Error }

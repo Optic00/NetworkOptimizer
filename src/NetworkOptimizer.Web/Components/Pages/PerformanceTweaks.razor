@@ -1163,7 +1163,11 @@ ls -la /var/config/run-syslog.sh</code></pre>
         new("sfp-sgmiiplus", "SFP+ 2.5 G SGMII+ Patch (Port 7)",
             "Loads a kernel module that forces the 2nd SFP+ port (Port 7 / eth6) from SGMII 1 G to SGMII+ (HSGMII) 2.5 G for GPON ONT SFP modules. Sets uniphy1 clock to 312.5 MHz, updates SerDes registers, and excludes the port from MAC sync polling to prevent speed reversion.",
             MutuallyExclusiveWith: "sfp-sgmiiplus-port6",
-            CompatibleModels: new[] { "ucg-fiber", "ucgf", "ucgfiber", "uxg-fiber", "uxgfiber" })
+            CompatibleModels: new[] { "ucg-fiber", "ucgf", "ucgfiber", "uxg-fiber", "uxgfiber" }),
+        new("ipv6-prefix-deprecation", "IPv6 Prefix Change Fix",
+            "When your ISP assigns a new delegated IPv6 prefix (for example after a PPPoE reconnect), UniFi OS stops advertising the old one without telling clients it is gone, so they keep using it and IPv6 connections time out for up to 30 minutes. This runs a small service that advertises each old prefix with lifetime 0 (RFC 9096), so clients switch to the new prefix within seconds. It never changes addresses, routes, or the UniFi configuration.",
+            ExtraNote: "A workaround until UniFi OS deprecates old prefixes itself. Applies to networks using SLAAC with a delegated prefix.",
+            CompatibleModels: new[] { "ucg-fiber", "ucgf", "ucgfiber" })
     };
 
     protected override async Task OnInitializedAsync()
