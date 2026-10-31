@@ -213,7 +213,24 @@ public class PerfTweaksIpv6DeprecationDeployTests : IDisposable
 
         success.Should().BeFalse();
         message.Should().Contain("Service did not start").And.Contain("boom");
+        message.Should().Contain("tweak removed again");
         _commands.Should().Contain(c => c.Contains("disable --now ipv6-prefix-deprecation"));
+    }
+
+    [Fact]
+    public async Task Deploy_ServiceNotStarting_ReportsAFailedCleanup()
+    {
+        var service = Build(c => c switch
+        {
+            _ when c.Contains("base64 -d >") => (true, "deployed"),
+            RunBootScript => (false, "Service failed to start"),
+            _ => (true, ""),
+        });
+
+        var (success, message, _) = await service.DeployTweakAsync("ipv6-prefix-deprecation");
+
+        success.Should().BeFalse();
+        message.Should().Contain("removing it failed");
     }
 
     [Fact]

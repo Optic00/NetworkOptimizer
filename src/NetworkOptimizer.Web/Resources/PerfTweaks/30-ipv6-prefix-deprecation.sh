@@ -255,6 +255,7 @@ class Tracker:
         self.last_send = {}
         self.events = []
         self.clock = None   # (wall, mono) of the previous update
+        self.touched = set()  # (bridge, prefix) whose times this process set since the last clock step
         self.mark_saved()
 
     def mark_saved(self):
@@ -270,20 +271,29 @@ class Tracker:
         log(msg)
 
     def _follow_clock(self, now, mono):
-        """Shifts stored wall-clock times by a clock step, so an NTP correction after boot
-        neither ends nor stretches a deprecation."""
+        """Shifts the times this process derived from a wrong clock by a clock step, so an NTP
+        correction after boot neither ends nor stretches a deprecation. Times loaded from disk
+        were taken under a correct clock and stay."""
         if self.clock is not None:
             step = (now - self.clock[0]) - (mono - self.clock[1])
             if abs(step) > CLOCK_STEP_S:
-                for br, st in self.bridges.items():
-                    for c in st["current"].values():
-                        c["expires"] = int(c["expires"] + step)
-                    for s in st["stale"].values():
-                        s["until"] = int(s["until"] + step)
-                self.saved_expires = {k: int(v + step) for k, v in self.saved_expires.items()}
+                for br, p in self.touched:
+                    st = self.bridges.get(br, {})
+                    if p in st.get("current", {}):
+                        st["current"][p]["expires"] = int(st["current"][p]["expires"] + step)
+                        if (br, p) in self.saved_expires:
+                            self.saved_expires[(br, p)] = int(self.saved_expires[(br, p)] + step)
+                    if p in st.get("stale", {}):
+                        st["stale"][p]["until"] = int(st["stale"][p]["until"] + step)
+                self.touched.clear()
                 self.dirty = True
-                log(f"wall clock stepped by {step:+.0f} s, stored times shifted")
+                log(f"wall clock stepped by {step:+.0f} s, times derived since then shifted")
         self.clock = (now, mono)
+
+    def lost_sight(self, br=None):
+        """A bridge (or, with None, everything) could not be observed: losses start over."""
+        for key in [k for k in self.missing if br is None or k[0] == br]:
+            del self.missing[key]
 
     def update(self, bridges, snap, present, now, mono):
         """Applies one snapshot. Returns {bridge: (prefixes, rdnss)} due to be sent now."""
@@ -291,6 +301,7 @@ class Tracker:
         for br in bridges:
             cur = snap.get(br)
             if cur is None:
+                self.lost_sight(br)
                 continue  # bridge not visible: no decision
             st = self.bridges.setdefault(br, {"current": {}, "stale": {}})
             if not cur:
@@ -302,9 +313,11 @@ class Tracker:
                 old = st["current"].get(p)
                 if old is None:
                     st["current"][p] = {"expires": exp, "addrs": sorted(info["addrs"])}
+                    self.touched.add((br, p))
                     self.dirty = True
                 elif exp > old["expires"]:
                     old["expires"] = exp
+                    self.touched.add((br, p))
                     if exp - self.saved_expires.get((br, p), 0) > EXPIRY_WRITE_STEP_S:
                         self.dirty = True
                 if old is not None and sorted(info["addrs"]) != old["addrs"]:
@@ -330,6 +343,7 @@ class Tracker:
                     if p not in present:
                         st["stale"][p] = {"until": clamp_until(old["expires"], now),
                                           "addrs": old["addrs"]}
+                        self.touched.add((br, p))
                         self._event(f"{br}: {p} replaced by {','.join(sorted(cur))}, deprecating")
                 if len(st["stale"]) > MAX_STALE_PER_BRIDGE:
                     keep = sorted(st["stale"], key=lambda q: st["stale"][q]["until"])[-MAX_STALE_PER_BRIDGE:]
@@ -386,6 +400,16 @@ def dnsmasq_running():
     return False
 
 
+def send_blocked(bridges):
+    """Why sending must wait, or None. Our RA renews the router entry on clients, so it goes
+    out only while the gateway routes IPv6 and dnsmasq advertises it too."""
+    if not has_default_route(run_ip("-6", "route", "show", "table", "all", "default")):
+        return "no IPv6 default route"
+    if not dnsmasq_running():
+        return "dnsmasq not running"
+    return None
+
+
 def read_dnsmasq():
     text = ""
     for f in sorted(glob.glob(DNSMASQ_GLOB)):
@@ -402,8 +426,8 @@ def link_info(dev):
     return link["ifindex"], lladdr, bytes.fromhex(mac.replace(":", ""))
 
 
-def send_ra(dev, cfg, prefixes, rdnss, dry_run):
-    ifindex, lladdr, mac = link_info(dev)
+def send_ra(dev, cfg, prefixes, rdnss, link, dry_run):
+    ifindex, lladdr, mac = link
     pkt = build_ra(cfg["prf"], cfg["rl"], mac, prefixes, rdnss)
     if dry_run:
         log(f"[dry-run] RA {dev} deprecate={','.join(prefixes)} rdnss0={','.join(rdnss)}")
@@ -472,27 +496,26 @@ def main():
             snap, present = parse_addrs(run_ip("-6", "addr", "show"), bridges)
             due = tracker.update(bridges, snap, present, now, mono)
             pause = None
-            if due:
-                # Our RA renews the router entry on clients: only while the gateway routes IPv6
-                # and dnsmasq advertises it too. Then recheck presence right before sending.
-                if not has_default_route(run_ip("-6", "route", "show", "table", "all", "default")):
-                    pause = "no IPv6 default route"
-                elif not dnsmasq_running():
-                    pause = "dnsmasq not running"
-                else:
-                    due = drop_present(due, parse_addrs(run_ip("-6", "addr", "show"), bridges)[1])
-            if pause != last_pause:
-                log(f"sending paused: {pause}" if pause else "sending resumed")
-                last_pause = pause
-            for br, (prefixes, rdnss) in ({} if pause else due).items():
+            for br, (prefixes, rdnss) in due.items():
                 try:
-                    send_ra(br, bridges[br], prefixes, rdnss, dry_run)
-                    tracker.sent(br, mono)
-                    last_send_wall = int(now)
+                    link = link_info(br)
+                    # Rechecked after the link lookup, right before this send.
+                    pause = send_blocked(bridges)
+                    if pause:
+                        break
+                    fresh = drop_present({br: (prefixes, rdnss)}, parse_addrs(run_ip("-6", "addr", "show"), bridges)[1])
+                    if br in fresh:
+                        send_ra(br, bridges[br], *fresh[br], link, dry_run)
+                        tracker.sent(br, mono)
+                        last_send_wall = int(now)
                 except (OSError, subprocess.SubprocessError, ValueError, IndexError, StopIteration, KeyError) as e:
                     error = f"send on {br} failed: {e!r}"
+            if due and pause != last_pause:
+                log(f"sending paused: {pause}" if pause else "sending resumed")
+                last_pause = pause
         except (OSError, subprocess.SubprocessError, ValueError) as e:
             error = f"snapshot failed: {e!r}"
+            tracker.lost_sight()
         if error != last_error:
             if error:
                 log(error)
@@ -574,9 +597,13 @@ if ! systemctl enable ipv6-prefix-deprecation >/dev/null 2>&1; then
     exit 1
 fi
 if [ -n "$DAEMON_CHANGED$UNIT_CHANGED" ]; then
-    systemctl restart ipv6-prefix-deprecation
+    ACTION=restart
 else
-    systemctl start ipv6-prefix-deprecation
+    ACTION=start
+fi
+if ! systemctl "$ACTION" ipv6-prefix-deprecation; then
+    log "systemctl $ACTION failed: $(journalctl -u ipv6-prefix-deprecation -n 3 -o cat --no-pager 2>/dev/null | tr '\n' ' ')"
+    exit 1
 fi
 
 sleep 2

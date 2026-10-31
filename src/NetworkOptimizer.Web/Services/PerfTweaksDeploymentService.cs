@@ -820,8 +820,9 @@ public class PerfTweaksDeploymentService : IPerfTweaksDeploymentService
             // nothing, so take it off again rather than leave a boot hook that fails at every boot.
             if (!runResult.success && tweakId == "ipv6-prefix-deprecation")
             {
-                await RunCommandAsync(Ipv6DeprecationRemoveCommand);
-                return (false, $"Service did not start, tweak removed again: {Tail(runResult.output)}", steps);
+                var cleanup = await RunCommandAsync(Ipv6DeprecationRemoveCommand);
+                var cleanedUp = cleanup.success && cleanup.output.Contains("removed");
+                return (false, $"Service did not start, {(cleanedUp ? "tweak removed again" : "and removing it failed; remove it from this page")}: {Tail(runResult.output)}", steps);
             }
             if (!runResult.success)
             {
