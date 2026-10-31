@@ -643,8 +643,20 @@ public class PerfTweaksDeploymentService : IPerfTweaksDeploymentService
         }
     }
 
-    // The daemon writes its status every 30 s; twice that without an update means it is stuck.
-    private const int Ipv6DeprecationStaleSeconds = 60;
+    // The daemon writes its status every 30 s; three times that without an update means it is stuck.
+    private const int Ipv6DeprecationStaleSeconds = 90;
+
+    // Stops the daemon before deleting it, or Restart=always brings it back, and reports "removed"
+    // only once nothing of it is left. Prefixes already deprecated on clients stay deprecated; no
+    // final RA is sent.
+    private const string Ipv6DeprecationRemoveCommand =
+        $"rm -f {OnBootDir}/30-ipv6-prefix-deprecation.sh; " +
+        "systemctl disable --now ipv6-prefix-deprecation 2>/dev/null; " +
+        "rm -f /etc/systemd/system/ipv6-prefix-deprecation.service; " +
+        "systemctl daemon-reload; " +
+        "rm -rf /data/ipv6-prefix-deprecation; " +
+        $"if [ ! -e {OnBootDir}/30-ipv6-prefix-deprecation.sh ] && [ ! -e /etc/systemd/system/ipv6-prefix-deprecation.service ] " +
+        "&& [ ! -e /data/ipv6-prefix-deprecation ] && ! systemctl is-active --quiet ipv6-prefix-deprecation; then echo 'removed'; fi";
 
     private static TweakDeploymentStatus ParseIpv6DeprecationStatus(Dictionary<string, string> sections)
     {
@@ -685,6 +697,8 @@ public class PerfTweaksDeploymentService : IPerfTweaksDeploymentService
         }
         else if (daemon.Networks == 0)
             tweak.HealthChecks.Add(new("Networks", "No SLAAC network found", HealthCheckStatus.Warning));
+        else if (daemon.State == "waiting")
+            tweak.HealthChecks.Add(new("Networks", "Waiting for a delegated prefix", HealthCheckStatus.Ok));
         else
         {
             tweak.HealthChecks.Add(new("Networks", $"{daemon.Networks} watched", HealthCheckStatus.Ok));
@@ -802,9 +816,13 @@ public class PerfTweaksDeploymentService : IPerfTweaksDeploymentService
             using var networkRestart = tweakId == "mongodb-ssd" ? NetworkRestartWindow() : null;
             Report($"Running {scriptName}...");
             var runResult = await RunCommandAsync($"{OnBootDir}/{scriptName} 2>&1", TimeSpan.FromMinutes(5));
-            // The boot script exits non-zero when its service did not start; the tweak then does nothing.
+            // The boot script exits non-zero when its service did not start; the tweak then does
+            // nothing, so take it off again rather than leave a boot hook that fails at every boot.
             if (!runResult.success && tweakId == "ipv6-prefix-deprecation")
-                return (false, $"Service did not start: {Tail(runResult.output)}", steps);
+            {
+                await RunCommandAsync(Ipv6DeprecationRemoveCommand);
+                return (false, $"Service did not start, tweak removed again: {Tail(runResult.output)}", steps);
+            }
             if (!runResult.success)
             {
                 Report($"Warning: Script returned non-zero exit. Output: {runResult.output}");
@@ -1134,15 +1152,7 @@ public class PerfTweaksDeploymentService : IPerfTweaksDeploymentService
             }
             else if (tweakId == "ipv6-prefix-deprecation")
             {
-                // Stop the daemon before deleting it, or Restart=always brings it back. Old prefixes
-                // already deprecated on clients stay deprecated; no final RA is sent.
-                removeCmd =
-                    $"rm -f {OnBootDir}/{scriptName}; " +
-                    "systemctl disable --now ipv6-prefix-deprecation 2>/dev/null; " +
-                    "rm -f /etc/systemd/system/ipv6-prefix-deprecation.service; " +
-                    "systemctl daemon-reload; " +
-                    "rm -rf /data/ipv6-prefix-deprecation; " +
-                    "systemctl is-active --quiet ipv6-prefix-deprecation || echo 'removed'";
+                removeCmd = Ipv6DeprecationRemoveCommand;
             }
             else
             {

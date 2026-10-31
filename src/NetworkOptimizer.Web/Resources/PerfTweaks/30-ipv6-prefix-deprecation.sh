@@ -34,23 +34,33 @@ if ! command -v python3 >/dev/null 2>&1; then
     exit 1
 fi
 
-mkdir -p "$DIR"
+mkdir -p "$DIR" || { log "Creating $DIR failed."; exit 1; }
 chmod 700 "$DIR"
 
-# Writes stdin to $1 only when the content differs, so a reboot rewrites nothing on the eMMC.
-# Prints "changed" when it wrote.
+# Writes stdin to $1 (mode $2) only when the content differs, so a reboot writes nothing to
+# the eMMC: the comparison copy lives on tmpfs. Prints "changed" when it wrote; fails without
+# touching $1 when any step fails.
 install_if_changed() {
-    local target="$1" tmp
-    tmp=$(mktemp "$target.XXXXXX") || return 1
-    cat > "$tmp"
+    local target="$1" mode="$2" tmp
+    tmp=$(mktemp /run/ipv6-prefix-deprecation-install.XXXXXX) || return 1
+    if ! cat > "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
     if [ -f "$target" ] && cmp -s "$tmp" "$target"; then
         rm -f "$tmp"
         return 0
     fi
-    chmod "$2" "$tmp" && mv -f "$tmp" "$target" && echo "changed"
+    if install -m "$mode" "$tmp" "$target.new" && mv -f "$target.new" "$target"; then
+        rm -f "$tmp"
+        echo "changed"
+        return 0
+    fi
+    rm -f "$tmp" "$target.new"
+    return 1
 }
 
-DAEMON_CHANGED=$(install_if_changed "$DAEMON" 700 <<'PYEOF'
+if ! DAEMON_CHANGED=$(install_if_changed "$DAEMON" 700 <<'PYEOF'
 #!/usr/bin/env python3
 """ipv6-prefix-deprecation: deprecates stale delegated LAN prefixes after a PD change.
 
@@ -100,6 +110,9 @@ CONFIRM_SNAPSHOTS = 2
 EXPIRY_WRITE_STEP_S = 3600
 STATUS_HEARTBEAT_S = 30
 CMD_TIMEOUT_S = 5
+# A wall clock step beyond this between two polls (NTP after boot) shifts all stored times.
+CLOCK_STEP_S = 60
+ERROR_REPORT_POLLS = 2
 INFINITE = 0xFFFFFFFF
 GUA = ipaddress.ip_network("2000::/3")
 
@@ -153,19 +166,27 @@ def parse_dnsmasq(text):
 
 
 def parse_addrs(links, bridges):
-    """Dynamic global /64s per bridge from `ip -j -6 addr show scope global`.
+    """Dynamic global /64s per bridge from `ip -j -6 addr show`, and every global /64 present.
 
-    Returns {bridge: {prefix: {"valid": s, "addrs": [addr, ...]}}}. A bridge missing from the
-    output is missing from the result, so callers can tell "gone" from "no prefix".
+    Returns ({bridge: {prefix: {"valid": s, "addrs": [addr, ...]}}}, {prefix, ...}). A watched
+    bridge without a global address maps to {}; a bridge missing from the output is missing
+    from the result, so callers can tell "no prefix" from "not visible". The present set holds
+    the /64 of every global address on any interface, static or deprecated ones included:
+    a prefix in it is never advertised as stale.
     """
-    snap = {}
+    snap, present = {}, set()
     for link in links:
         dev = link.get("ifname")
+        for a in link.get("addr_info", []):
+            if a.get("family") == "inet6" and "local" in a and a.get("scope") == "global":
+                present.add(str(ipaddress.ip_network(f"{a['local']}/64", strict=False)))
         if dev not in bridges:
             continue
         prefixes = snap.setdefault(dev, {})
         for a in link.get("addr_info", []):
-            if a.get("family") != "inet6" or "local" not in a or a.get("prefixlen") != 64:
+            if a.get("family") != "inet6" or "local" not in a or a.get("scope") != "global":
+                continue
+            if a.get("prefixlen") != 64:
                 continue
             if a.get("tentative") or a.get("dadfailed") or a.get("deprecated"):
                 continue
@@ -178,7 +199,23 @@ def parse_addrs(links, bridges):
             entry = prefixes.setdefault(str(net), {"valid": 0, "addrs": []})
             entry["valid"] = max(entry["valid"], valid)
             entry["addrs"].append(str(ipaddress.ip_address(a["local"])))
-    return snap
+    return snap, present
+
+
+def has_default_route(routes):
+    """True when `ip -j -6 route show table all default` lists a usable default route."""
+    return any(r.get("dst") == "default" and r.get("type", "unicast") == "unicast" for r in routes)
+
+
+def drop_present(due, present):
+    """Removes prefixes that are present again (and their RDNSS addresses) from a send list."""
+    out = {}
+    for br, (prefixes, rdnss) in due.items():
+        keep = [p for p in prefixes if p not in present]
+        if keep:
+            nets = [ipaddress.ip_network(p) for p in keep]
+            out[br] = (keep, [a for a in rdnss if any(ipaddress.ip_address(a) in n for n in nets)])
+    return out
 
 
 def build_ra(prf, router_lifetime, mac, prefixes, rdnss):
@@ -213,10 +250,11 @@ class Tracker:
                 self.bridges[br] = {"current": dict(st.get("current", {})),
                                     "stale": dict(st.get("stale", {}))}
         self.dirty = False
-        self.missing = {}   # bridge -> consecutive snapshots with a prefix missing
+        self.missing = {}   # (bridge, prefix) -> consecutive snapshots without it
         self.schedule = {}  # bridge -> {"start": mono, "n": sends, "next": mono}
         self.last_send = {}
         self.events = []
+        self.clock = None   # (wall, mono) of the previous update
         self.mark_saved()
 
     def mark_saved(self):
@@ -231,16 +269,33 @@ class Tracker:
         self.events.append(msg)
         log(msg)
 
-    def update(self, bridges, snap, now, mono):
+    def _follow_clock(self, now, mono):
+        """Shifts stored wall-clock times by a clock step, so an NTP correction after boot
+        neither ends nor stretches a deprecation."""
+        if self.clock is not None:
+            step = (now - self.clock[0]) - (mono - self.clock[1])
+            if abs(step) > CLOCK_STEP_S:
+                for br, st in self.bridges.items():
+                    for c in st["current"].values():
+                        c["expires"] = int(c["expires"] + step)
+                    for s in st["stale"].values():
+                        s["until"] = int(s["until"] + step)
+                self.saved_expires = {k: int(v + step) for k, v in self.saved_expires.items()}
+                self.dirty = True
+                log(f"wall clock stepped by {step:+.0f} s, stored times shifted")
+        self.clock = (now, mono)
+
+    def update(self, bridges, snap, present, now, mono):
         """Applies one snapshot. Returns {bridge: (prefixes, rdnss)} due to be sent now."""
-        all_current = {p for prefixes in snap.values() for p in prefixes}
+        self._follow_clock(now, mono)
         for br in bridges:
             cur = snap.get(br)
             if cur is None:
                 continue  # bridge not visible: no decision
             st = self.bridges.setdefault(br, {"current": {}, "stale": {}})
             if not cur:
-                self.missing[br] = 0
+                for p in st["current"]:
+                    self.missing.pop((br, p), None)
                 continue  # no prefix at all (WAN down): wait for a new one
             for p, info in cur.items():
                 exp = int(now + info["valid"])
@@ -255,28 +310,32 @@ class Tracker:
                 if old is not None and sorted(info["addrs"]) != old["addrs"]:
                     old["addrs"] = sorted(info["addrs"])
                     self.dirty = True
-            for p in [p for p in st["stale"] if p in all_current]:
+            for p in [p for p in st["stale"] if p in present]:
                 del st["stale"][p]
                 self.dirty = True
                 self._event(f"{br}: {p} is back, no longer deprecated")
-            gone = [p for p in st["current"] if p not in cur]
-            if not gone:
-                self.missing[br] = 0
-            else:
-                self.missing[br] = self.missing.get(br, 0) + 1
-                if self.missing[br] >= CONFIRM_SNAPSHOTS:
-                    self.missing[br] = 0
-                    for p in gone:
-                        old = st["current"].pop(p)
-                        if p not in all_current:
-                            st["stale"][p] = {"until": clamp_until(old["expires"], now),
-                                              "addrs": old["addrs"]}
-                            self._event(f"{br}: {p} replaced by {','.join(sorted(cur))}, deprecating")
-                    if len(st["stale"]) > MAX_STALE_PER_BRIDGE:
-                        keep = sorted(st["stale"], key=lambda q: st["stale"][q]["until"])[-MAX_STALE_PER_BRIDGE:]
-                        st["stale"] = {q: st["stale"][q] for q in keep}
-                    self.dirty = True
-                    self.schedule[br] = {"start": mono, "n": 0, "next": mono}
+            confirmed = []
+            for p in list(st["current"]):
+                if p in cur:
+                    self.missing.pop((br, p), None)
+                    continue
+                n = self.missing.get((br, p), 0) + 1
+                self.missing[(br, p)] = n
+                if n >= CONFIRM_SNAPSHOTS:
+                    del self.missing[(br, p)]
+                    confirmed.append(p)
+            if confirmed:
+                for p in confirmed:
+                    old = st["current"].pop(p)
+                    if p not in present:
+                        st["stale"][p] = {"until": clamp_until(old["expires"], now),
+                                          "addrs": old["addrs"]}
+                        self._event(f"{br}: {p} replaced by {','.join(sorted(cur))}, deprecating")
+                if len(st["stale"]) > MAX_STALE_PER_BRIDGE:
+                    keep = sorted(st["stale"], key=lambda q: st["stale"][q]["until"])[-MAX_STALE_PER_BRIDGE:]
+                    st["stale"] = {q: st["stale"][q] for q in keep}
+                self.dirty = True
+                self.schedule[br] = {"start": mono, "n": 0, "next": mono}
         due = {}
         for br, st in self.bridges.items():
             for p in [p for p, s in st["stale"].items() if s["until"] <= now]:
@@ -291,7 +350,7 @@ class Tracker:
             sched = self.schedule.setdefault(br, {"start": mono, "n": 0, "next": mono})
             if mono < sched["next"] or mono - self.last_send.get(br, -1e9) < MIN_GAP_S:
                 continue
-            prefixes = sorted(p for p in st["stale"] if p not in all_current)
+            prefixes = sorted(p for p in st["stale"] if p not in present)
             if prefixes:
                 rdnss = sorted({a for p in prefixes for a in st["stale"][p]["addrs"]})
                 due[br] = (prefixes, rdnss)
@@ -314,6 +373,17 @@ def run_ip(*args):
     out = subprocess.run(["ip", "-j", *args], capture_output=True, text=True,
                          check=True, timeout=CMD_TIMEOUT_S).stdout
     return json.loads(out or "[]")
+
+
+def dnsmasq_running():
+    for comm in glob.glob("/proc/[0-9]*/comm"):
+        try:
+            with open(comm) as fh:
+                if fh.read().strip() == "dnsmasq":
+                    return True
+        except OSError:
+            pass
+    return False
 
 
 def read_dnsmasq():
@@ -385,22 +455,36 @@ def main():
     tracker = Tracker(None if dry_run else load_state())
     log(f"started{' (dry-run)' if dry_run else ''}, tracking {sum(len(s['current']) for s in tracker.bridges.values())}"
         f" prefixes, deprecating {tracker.counts()}")
-    last_skipped, last_error, save_failed = None, None, False
+    last_skipped, last_error, error_polls, save_failed = None, None, 0, False
+    last_pause = None
     status, status_written = None, 0.0
     last_send_wall = None
     while True:
         now, mono = time.time(), time.monotonic()
         error = None
-        bridges = {}
+        bridges, snap = {}, {}
         try:
             bridges, skipped = read_dnsmasq()
             if skipped != last_skipped:
                 for reason in skipped:
                     log(f"skipped {reason}")
                 last_skipped = skipped
-            snap = parse_addrs(run_ip("-6", "addr", "show", "scope", "global"), bridges)
-            due = tracker.update(bridges, snap, now, mono)
-            for br, (prefixes, rdnss) in due.items():
+            snap, present = parse_addrs(run_ip("-6", "addr", "show"), bridges)
+            due = tracker.update(bridges, snap, present, now, mono)
+            pause = None
+            if due:
+                # Our RA renews the router entry on clients: only while the gateway routes IPv6
+                # and dnsmasq advertises it too. Then recheck presence right before sending.
+                if not has_default_route(run_ip("-6", "route", "show", "table", "all", "default")):
+                    pause = "no IPv6 default route"
+                elif not dnsmasq_running():
+                    pause = "dnsmasq not running"
+                else:
+                    due = drop_present(due, parse_addrs(run_ip("-6", "addr", "show"), bridges)[1])
+            if pause != last_pause:
+                log(f"sending paused: {pause}" if pause else "sending resumed")
+                last_pause = pause
+            for br, (prefixes, rdnss) in ({} if pause else due).items():
                 try:
                     send_ra(br, bridges[br], prefixes, rdnss, dry_run)
                     tracker.sent(br, mono)
@@ -413,6 +497,9 @@ def main():
             if error:
                 log(error)
             last_error = error
+        # A single failed poll is not worth an error on the status card.
+        error_polls = error_polls + 1 if error else 0
+        reported_error = error if error_polls >= ERROR_REPORT_POLLS else None
         if tracker.dirty and not dry_run:
             try:
                 write_atomic(STATE_FILE, json.dumps(tracker.to_state(), sort_keys=True))
@@ -424,14 +511,14 @@ def main():
                     log(f"saving state failed, retrying: {e!r}")
                 save_failed = True
         deprecating = tracker.counts()
-        current = sum(len(s["current"]) for s in tracker.bridges.values())
+        current = any(snap.get(br) for br in bridges)
         new_status = {
-            "state": "error" if error else "deprecating" if deprecating else "ready" if current else "waiting",
+            "state": "error" if reported_error else "deprecating" if deprecating else "ready" if current else "waiting",
             "networks": len(bridges),
             "deprecating": deprecating,
             "last_send": last_send_wall,
             "last_event": tracker.events[-1] if tracker.events else None,
-            "error": error or ("saving state failed" if save_failed else None),
+            "error": reported_error or ("saving state failed" if save_failed else None),
         }
         if new_status != status or mono - status_written >= STATUS_HEARTBEAT_S:
             try:
@@ -446,16 +533,19 @@ def main():
 if __name__ == "__main__":
     sys.exit(main())
 PYEOF
-)
+); then
+    log "Writing $DAEMON failed."
+    exit 1
+fi
 
-UNIT_CHANGED=$(install_if_changed "$UNIT" 644 <<'EOF'
+if ! UNIT_CHANGED=$(install_if_changed "$UNIT" 644 <<'EOF'
 [Unit]
 Description=Deprecate stale delegated IPv6 prefixes on LAN (RFC 9096)
 After=network.target
 StartLimitIntervalSec=0
 
 [Service]
-ExecStart=/usr/bin/python3 -u /data/ipv6-prefix-deprecation/ipv6-prefix-deprecation.py
+ExecStart=/usr/bin/env python3 -u /data/ipv6-prefix-deprecation/ipv6-prefix-deprecation.py
 Restart=always
 RestartSec=10
 Nice=10
@@ -470,10 +560,19 @@ PrivateTmp=yes
 [Install]
 WantedBy=multi-user.target
 EOF
-)
+); then
+    log "Writing $UNIT failed."
+    exit 1
+fi
 
-[ -n "$UNIT_CHANGED" ] && systemctl daemon-reload
-systemctl enable ipv6-prefix-deprecation >/dev/null 2>&1
+if [ -n "$UNIT_CHANGED" ] && ! systemctl daemon-reload; then
+    log "systemctl daemon-reload failed."
+    exit 1
+fi
+if ! systemctl enable ipv6-prefix-deprecation >/dev/null 2>&1; then
+    log "Enabling the service failed."
+    exit 1
+fi
 if [ -n "$DAEMON_CHANGED$UNIT_CHANGED" ]; then
     systemctl restart ipv6-prefix-deprecation
 else
