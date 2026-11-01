@@ -273,7 +273,8 @@ class Tracker:
     def _follow_clock(self, now, mono):
         """Shifts the times this process derived from a wrong clock by a clock step, so an NTP
         correction after boot neither ends nor stretches a deprecation. Times loaded from disk
-        were taken under a correct clock and stay."""
+        were taken under a correct clock and stay. After a step every time is in the corrected
+        clock, so a later step shifts all of them."""
         if self.clock is not None:
             step = (now - self.clock[0]) - (mono - self.clock[1])
             if abs(step) > CLOCK_STEP_S:
@@ -285,7 +286,8 @@ class Tracker:
                             self.saved_expires[(br, p)] = int(self.saved_expires[(br, p)] + step)
                     if p in st.get("stale", {}):
                         st["stale"][p]["until"] = int(st["stale"][p]["until"] + step)
-                self.touched.clear()
+                self.touched = {(br, p) for br, st in self.bridges.items()
+                                for part in ("current", "stale") for p in st[part]}
                 self.dirty = True
                 log(f"wall clock stepped by {step:+.0f} s, times derived since then shifted")
         self.clock = (now, mono)
@@ -298,6 +300,8 @@ class Tracker:
     def update(self, bridges, snap, present, now, mono):
         """Applies one snapshot. Returns {bridge: (prefixes, rdnss)} due to be sent now."""
         self._follow_clock(now, mono)
+        for br in {k[0] for k in self.missing} - set(bridges):
+            self.lost_sight(br)  # bridge not configured right now: no decision
         for br in bridges:
             cur = snap.get(br)
             if cur is None:
@@ -341,9 +345,10 @@ class Tracker:
                 for p in confirmed:
                     old = st["current"].pop(p)
                     if p not in present:
-                        st["stale"][p] = {"until": clamp_until(old["expires"], now),
-                                          "addrs": old["addrs"]}
-                        self.touched.add((br, p))
+                        until = clamp_until(old["expires"], now)
+                        st["stale"][p] = {"until": until, "addrs": old["addrs"]}
+                        if until != old["expires"]:
+                            self.touched.add((br, p))  # derived from now; else keeps its origin
                         self._event(f"{br}: {p} replaced by {','.join(sorted(cur))}, deprecating")
                 if len(st["stale"]) > MAX_STALE_PER_BRIDGE:
                     keep = sorted(st["stale"], key=lambda q: st["stale"][q]["until"])[-MAX_STALE_PER_BRIDGE:]
